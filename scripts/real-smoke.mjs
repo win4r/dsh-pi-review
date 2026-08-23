@@ -103,7 +103,7 @@ try {
     await writeFile(join(agentDir, 'models.json'), modelsDocument, { encoding: 'utf8', mode: 0o400 })
   }
   const request = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     snapshot: {
       scope: 'working-tree',
       repoRoot: fixtureRoot,
@@ -114,6 +114,7 @@ try {
       omitted: [],
     },
     model,
+    severityFloor: 'low',
     thinkingLevel: 'high',
     timeoutMs: 240_000,
     ...(agentDir === undefined ? {} : { agentDir }),
@@ -146,7 +147,7 @@ try {
   } catch {
     throw new Error(`Worker returned invalid JSON; stderr bytes=${Buffer.byteLength(child.stderr)}`)
   }
-  if (envelope?.protocolVersion !== 1 || envelope?.ok !== true) {
+  if (envelope?.protocolVersion !== 2 || envelope?.ok !== true) {
     const code = envelope?.error?.code ?? 'INVALID_ENVELOPE'
     const diagnostic = process.env.PI_REVIEW_SMOKE_DIAGNOSTICS === '1'
       ? `; diagnostic=${JSON.stringify(child.stderr.trim().slice(0, 1_024))}`
@@ -156,6 +157,13 @@ try {
   if (!Array.isArray(envelope.result?.findings)
     || !envelope.result.findings.some(finding => finding.path === 'review-target.ts')) {
     throw new Error('Pi did not report the deliberate authorization regression')
+  }
+  const usage = envelope.result?.usage
+  if (usage?.reported !== true
+    || !Number.isSafeInteger(usage.turns) || usage.turns < 0
+    || !Number.isSafeInteger(usage.totalTokens) || usage.totalTokens < 0
+    || !Number.isFinite(usage.estimatedCostUsd) || usage.estimatedCostUsd < 0) {
+    throw new Error('Pi returned invalid one-review usage statistics')
   }
   if (await readFile(targetPath, 'utf8') !== defectiveSource) {
     throw new Error('Worker changed the review target despite read-only confinement')
@@ -178,7 +186,10 @@ try {
 
   process.stdout.write(`${JSON.stringify({
     ok: true,
+    provider: envelope.result.provider,
     model: envelope.result.model,
+    totalTokens: envelope.result.usage.totalTokens,
+    estimatedCostUsd: envelope.result.usage.estimatedCostUsd,
     findingCount: envelope.result.findings.length,
     sandboxEnforcement: confined.enforcement,
     durationMs: envelope.result.durationMs,

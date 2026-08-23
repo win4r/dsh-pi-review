@@ -63,6 +63,32 @@ describe('Git request validation and NUL parsing', () => {
     expect(() => validateBaseRef('HEAD~2')).toThrow(/ordinary Git ref/)
   })
 
+  it('normalizes branch and commit selectors with strict cross-scope ownership', () => {
+    expect(normalizeSnapshotRequest({ scope: 'branch', base_ref: 'origin/main' })).toEqual({
+      scope: 'branch', baseRef: 'origin/main', headRef: 'HEAD',
+    })
+    expect(normalizeSnapshotRequest({
+      scope: 'branch', base_ref: 'main', head_ref: 'feature/review', paths: ['src/a.ts'],
+    })).toEqual({
+      scope: 'branch', baseRef: 'main', headRef: 'feature/review', paths: ['src/a.ts'],
+    })
+    expect(normalizeSnapshotRequest({ scope: 'commit' })).toEqual({
+      scope: 'commit', commitRef: 'HEAD',
+    })
+    expect(normalizeSnapshotRequest({ scope: 'commit', commit_ref: 'review-target' })).toEqual({
+      scope: 'commit', commitRef: 'review-target',
+    })
+
+    expect(() => normalizeSnapshotRequest({ scope: 'branch' })).toThrow(/base_ref is required/)
+    expect(() => normalizeSnapshotRequest({ scope: 'commit', head_ref: 'HEAD' })).toThrow(/only when scope is branch/)
+    expect(() => normalizeSnapshotRequest({ scope: 'branch', base_ref: 'main', commit_ref: 'HEAD' }))
+      .toThrow(/only when scope is commit/)
+    expect(() => normalizeSnapshotRequest({ scope: 'base', base_ref: 'main', head_ref: 'HEAD' }))
+      .toThrow(/only when scope is branch/)
+    expect(() => normalizeSnapshotRequest({ scope: 'commit', commit_ref: 'HEAD~1' }))
+      .toThrow(/ordinary Git ref/)
+  })
+
   it('parses ordinary, rename, and binary NUL records without newline ambiguity', () => {
     expect(parseNameStatusZ('M\0src/a.ts\0R100\0old.ts\0new.ts\0')).toEqual([
       { status: 'M', path: 'src/a.ts' },
@@ -146,6 +172,315 @@ describe('Git snapshot integration', () => {
     expect(snapshot.base).toMatch(/^[0-9a-f]{40,64}$/)
     expect(snapshot.changedPaths.map(change => change.path)).toEqual(['tracked.txt'])
     expect(snapshot.diff).not.toContain('ignored-by-filter.txt')
+  })
+
+  it('captures a branch from its unique merge base to a frozen head without live changes', async () => {
+    const root = await repository()
+    const common = git(root, 'rev-parse', 'HEAD').trim()
+    git(root, 'branch', 'review-base', common)
+    await writeFile(join(root, 'feature.ts'), 'export const feature = "committed"\n')
+    git(root, 'add', 'feature.ts')
+    git(root, 'commit', '-qm', 'feature change')
+    const featureHead = git(root, 'rev-parse', 'HEAD').trim()
+    await writeFile(join(root, 'tracked.txt'), 'index-only change\n')
+    git(root, 'add', 'tracked.txt')
+    await writeFile(join(root, 'untracked.txt'), 'must not enter branch snapshot\n')
+
+    const ctx = await context()
+    const spawnedArgv: string[][] = []
+    const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess)
+    ctx.subprocess.spawn = ((spec) => {
+      spawnedArgv.push([...spec.argv])
+      return originalSpawn(spec)
+    }) as typeof ctx.subprocess.spawn
+    const snapshot = await captureGitSnapshot(
+      ctx,
+      root,
+      { scope: 'branch', baseRef: 'review-base' },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )
+
+    expect(snapshot.head).toBe(featureHead)
+    expect(snapshot.base).toBe(common)
+    expect(snapshot.changedPaths).toEqual([{ status: 'A', path: 'feature.ts' }])
+    expect(snapshot.diff).toContain('export const feature = "committed"')
+    expect(snapshot.diff).not.toContain('index-only change')
+    expect(snapshot.diff).not.toContain('must not enter branch snapshot')
+    const patchArgv = spawnedArgv.find(argv => argv.includes('--patch'))
+    expect(patchArgv).toEqual(expect.arrayContaining([common, featureHead]))
+    expect(spawnedArgv.some(argv => argv.includes('--others'))).toBe(false)
+  })
+
+  it('captures exactly one ordinary commit relative to its single parent', async () => {
+    const root = await repository()
+    const parent = git(root, 'rev-parse', 'HEAD').trim()
+    await writeFile(join(root, 'tracked.txt'), 'target commit\n')
+    git(root, 'add', 'tracked.txt')
+    git(root, 'commit', '-qm', 'target')
+    const target = git(root, 'rev-parse', 'HEAD').trim()
+    await writeFile(join(root, 'later.ts'), 'export const later = true\n')
+    git(root, 'add', 'later.ts')
+    git(root, 'commit', '-qm', 'later commit')
+    const outside = await mkdtemp(join(tmpdir(), 'dsh-pi-review-commit-outside-'))
+    roots.push(outside)
+    const outsideSecret = join(outside, 'secret.txt')
+    await writeFile(outsideSecret, 'dirty worktree secret sentinel\n')
+    unlinkSync(join(root, 'tracked.txt'))
+    await link(outsideSecret, join(root, 'tracked.txt'))
+    await writeFile(join(root, 'untracked.txt'), 'untracked secret sentinel\n')
+
+    const ctx = await context()
+    const snapshot = await captureGitSnapshot(
+      ctx,
+      root,
+      { scope: 'commit', commitRef: target },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )
+
+    expect(snapshot.head).toBe(target)
+    expect(snapshot.base).toBe(parent)
+    expect(snapshot.changedPaths).toEqual([{ status: 'M', path: 'tracked.txt' }])
+    expect(snapshot.diff).toContain('target commit')
+    expect(snapshot.diff).not.toContain('later.ts')
+    expect(snapshot.diff).not.toContain('dirty worktree secret sentinel')
+    expect(snapshot.diff).not.toContain('untracked secret sentinel')
+  })
+
+  it('captures explicit historical refs without consulting an unborn workspace HEAD', async () => {
+    const root = await repository()
+    const parent = git(root, 'rev-parse', 'HEAD').trim()
+    await writeFile(join(root, 'historical.ts'), 'export const historical = true\n')
+    git(root, 'add', 'historical.ts')
+    git(root, 'commit', '-qm', 'historical target')
+    const target = git(root, 'rev-parse', 'HEAD').trim()
+    git(root, 'checkout', '-q', '--orphan', 'unborn-workspace')
+    git(root, 'rm', '-rfq', '--', '.')
+
+    const ctx = await context()
+    const spawnedArgv: string[][] = []
+    const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess)
+    ctx.subprocess.spawn = ((spec) => {
+      spawnedArgv.push([...spec.argv])
+      return originalSpawn(spec)
+    }) as typeof ctx.subprocess.spawn
+    const config = resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 })
+    const branch = await captureGitSnapshot(
+      ctx,
+      root,
+      { scope: 'branch', baseRef: parent, headRef: target },
+      config,
+      new AbortController().signal,
+    )
+    const commit = await captureGitSnapshot(
+      ctx,
+      root,
+      { scope: 'commit', commitRef: target },
+      config,
+      new AbortController().signal,
+    )
+
+    expect(branch.changedPaths).toEqual([{ status: 'A', path: 'historical.ts' }])
+    expect(commit.changedPaths).toEqual(branch.changedPaths)
+    expect(spawnedArgv.some(argv => argv.includes('HEAD^{commit}'))).toBe(false)
+  })
+
+  it.each(['staged', 'working-tree'] as const)(
+    'pins every %s diff command to the initially resolved HEAD object id',
+    async (scope) => {
+      const root = await repository()
+      const head = git(root, 'rev-parse', 'HEAD').trim()
+      await writeFile(join(root, 'tracked.txt'), 'frozen head comparison\n')
+      if (scope === 'staged') git(root, 'add', 'tracked.txt')
+
+      const ctx = await context()
+      const diffArgv: string[][] = []
+      const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess)
+      ctx.subprocess.spawn = ((spec) => {
+        if (spec.argv.includes('diff')) diffArgv.push([...spec.argv])
+        return originalSpawn(spec)
+      }) as typeof ctx.subprocess.spawn
+
+      await captureGitSnapshot(
+        ctx,
+        root,
+        { scope },
+        resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+        new AbortController().signal,
+      )
+
+      expect(diffArgv.length).toBeGreaterThan(0)
+      for (const argv of diffArgv) {
+        expect(argv).toContain(head)
+        expect(argv).not.toContain('HEAD')
+      }
+    },
+  )
+
+  it('rejects root and merge commits with one stable unsupported-shape code', async () => {
+    const rootOnly = await repository()
+    const rootCommit = git(rootOnly, 'rev-parse', 'HEAD').trim()
+    const rootContext = await context()
+    await expect(captureGitSnapshot(
+      rootContext,
+      rootOnly,
+      { scope: 'commit', commitRef: rootCommit },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )).rejects.toMatchObject({ code: 'PI_REVIEW_UNSUPPORTED_COMMIT_SHAPE' })
+
+    const merged = await repository()
+    const primary = git(merged, 'branch', '--show-current').trim()
+    git(merged, 'checkout', '-qb', 'review-topic')
+    await writeFile(join(merged, 'topic.ts'), 'export const topic = true\n')
+    git(merged, 'add', 'topic.ts')
+    git(merged, 'commit', '-qm', 'topic')
+    git(merged, 'checkout', '-q', primary)
+    await writeFile(join(merged, 'primary.ts'), 'export const primary = true\n')
+    git(merged, 'add', 'primary.ts')
+    git(merged, 'commit', '-qm', 'primary')
+    git(merged, 'merge', '--no-ff', '-qm', 'merge topic', 'review-topic')
+    const mergeCommit = git(merged, 'rev-parse', 'HEAD').trim()
+    const mergeContext = await context()
+    await expect(captureGitSnapshot(
+      mergeContext,
+      merged,
+      { scope: 'commit', commitRef: mergeCommit },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )).rejects.toMatchObject({ code: 'PI_REVIEW_UNSUPPORTED_COMMIT_SHAPE' })
+  })
+
+  it('rejects branch histories with no unique merge base', async () => {
+    const disconnected = await repository()
+    const connectedTip = git(disconnected, 'rev-parse', 'HEAD').trim()
+    git(disconnected, 'checkout', '--orphan', 'disconnected-history')
+    git(disconnected, 'rm', '-rfq', '--', '.')
+    await writeFile(join(disconnected, 'orphan.ts'), 'export const orphan = true\n')
+    git(disconnected, 'add', 'orphan.ts')
+    git(disconnected, 'commit', '-qm', 'disconnected root')
+    const disconnectedTip = git(disconnected, 'rev-parse', 'HEAD').trim()
+    const disconnectedContext = await context()
+    await expect(captureGitSnapshot(
+      disconnectedContext,
+      disconnected,
+      { scope: 'branch', baseRef: connectedTip, headRef: disconnectedTip },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )).rejects.toMatchObject({ code: 'PI_REVIEW_MERGE_BASE_UNAVAILABLE' })
+
+    const crissCross = await repository()
+    git(crissCross, 'branch', 'review-a')
+    git(crissCross, 'branch', 'review-b')
+    git(crissCross, 'checkout', '-q', 'review-a')
+    await writeFile(join(crissCross, 'a.ts'), 'export const a = 1\n')
+    git(crissCross, 'add', 'a.ts')
+    git(crissCross, 'commit', '-qm', 'a1')
+    const a1 = git(crissCross, 'rev-parse', 'HEAD').trim()
+    git(crissCross, 'checkout', '-q', 'review-b')
+    await writeFile(join(crissCross, 'b.ts'), 'export const b = 1\n')
+    git(crissCross, 'add', 'b.ts')
+    git(crissCross, 'commit', '-qm', 'b1')
+    const b1 = git(crissCross, 'rev-parse', 'HEAD').trim()
+    git(crissCross, 'checkout', '-q', 'review-a')
+    git(crissCross, 'merge', '--no-ff', '-qm', 'merge b1', b1)
+    const mergeA = git(crissCross, 'rev-parse', 'HEAD').trim()
+    git(crissCross, 'checkout', '-q', 'review-b')
+    git(crissCross, 'merge', '--no-ff', '-qm', 'merge a1', a1)
+    const mergeB = git(crissCross, 'rev-parse', 'HEAD').trim()
+    expect(git(crissCross, 'merge-base', '--all', mergeA, mergeB).trim().split('\n').sort())
+      .toEqual([a1, b1].sort())
+
+    const crissCrossContext = await context()
+    await expect(captureGitSnapshot(
+      crissCrossContext,
+      crissCross,
+      { scope: 'branch', baseRef: mergeA, headRef: mergeB },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )).rejects.toMatchObject({ code: 'PI_REVIEW_AMBIGUOUS_MERGE_BASE' })
+  })
+
+  it.each(['branch', 'commit'] as const)(
+    'rejects a moving %s ref after re-enumerating the frozen object diff',
+    async (scope) => {
+      const root = await repository()
+      const base = git(root, 'rev-parse', 'HEAD').trim()
+      await writeFile(join(root, 'target.ts'), 'export const target = 1\n')
+      git(root, 'add', 'target.ts')
+      git(root, 'commit', '-qm', 'target')
+      const target = git(root, 'rev-parse', 'HEAD').trim()
+      git(root, 'branch', 'moving-review', target)
+      await writeFile(join(root, 'later.ts'), 'export const later = 1\n')
+      git(root, 'add', 'later.ts')
+      git(root, 'commit', '-qm', 'later')
+      const moved = git(root, 'rev-parse', 'HEAD').trim()
+
+      const ctx = await context()
+      const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess)
+      const nameStatusArgv: string[][] = []
+      ctx.subprocess.spawn = ((spec) => {
+        if (spec.argv.includes('--name-status')) {
+          nameStatusArgv.push([...spec.argv])
+          if (nameStatusArgv.length === 2) git(root, 'update-ref', 'refs/heads/moving-review', moved)
+        }
+        return originalSpawn(spec)
+      }) as typeof ctx.subprocess.spawn
+
+      const request = scope === 'branch'
+        ? { scope, baseRef: base, headRef: 'moving-review' }
+        : { scope, commitRef: 'moving-review' }
+      await expect(captureGitSnapshot(
+        ctx,
+        root,
+        request,
+        resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+        new AbortController().signal,
+      )).rejects.toMatchObject({ code: 'PI_REVIEW_SNAPSHOT_RACED' })
+      expect(nameStatusArgv).toHaveLength(2)
+      for (const argv of nameStatusArgv) {
+        expect(argv).toEqual(expect.arrayContaining([base, target]))
+        expect(argv).not.toContain('moving-review')
+      }
+    },
+  )
+
+  it('re-resolves a base-scope ref after frozen re-enumeration and rejects motion', async () => {
+    const root = await repository()
+    const originalBase = git(root, 'rev-parse', 'HEAD').trim()
+    git(root, 'branch', 'moving-base', originalBase)
+    await writeFile(join(root, 'later.ts'), 'export const later = 1\n')
+    git(root, 'add', 'later.ts')
+    git(root, 'commit', '-qm', 'later')
+    const movedBase = git(root, 'rev-parse', 'HEAD').trim()
+    await writeFile(join(root, 'tracked.txt'), 'working tree change\n')
+
+    const ctx = await context()
+    const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess)
+    const nameStatusArgv: string[][] = []
+    ctx.subprocess.spawn = ((spec) => {
+      if (spec.argv.includes('--name-status')) {
+        nameStatusArgv.push([...spec.argv])
+        if (nameStatusArgv.length === 2) {
+          git(root, 'update-ref', 'refs/heads/moving-base', movedBase)
+        }
+      }
+      return originalSpawn(spec)
+    }) as typeof ctx.subprocess.spawn
+
+    await expect(captureGitSnapshot(
+      ctx,
+      root,
+      { scope: 'base', baseRef: 'moving-base' },
+      resolveConfig({ maxDiffBytes: 65_536, maxFiles: 10 }),
+      new AbortController().signal,
+    )).rejects.toMatchObject({ code: 'PI_REVIEW_SNAPSHOT_RACED' })
+    expect(nameStatusArgv).toHaveLength(2)
+    for (const argv of nameStatusArgv) {
+      expect(argv).toContain(originalBase)
+      expect(argv).not.toContain('moving-base')
+    }
   })
 
   it('treats path filters literally instead of honoring Git pathspec magic', async () => {

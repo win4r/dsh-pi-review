@@ -1,6 +1,6 @@
 # dsh-pi-review
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供隔离、只读的 [Pi Agent](https://github.com/earendil-works/pi) Git 改动审查。它注册一个根 Agent 工具 `pi_review_diff`，冻结确定性的 Git 快照，在 Harness 的只读沙箱中启动独立 Pi SDK Worker，并返回可验证的结构化 finding。
+为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供隔离、只读的 [Pi Agent](https://github.com/earendil-works/pi) Git 改动审查。它注册一个根 Agent 工具 `pi_review_diff`，冻结确定性的 Git 快照，在 Harness 的只读沙箱中启动独立 Pi SDK Worker，并返回带分类、严重度策略和 Pi 用量统计的可验证结构化 finding。
 
 > [!IMPORTANT]
 > 只读沙箱保护的是本地文件不被 Worker 修改，不是数据保密边界。被选中的 diff 与变更文件内容会发送给配置的模型 Provider。不要用未经授权的外部 Provider 审查私有、敏感或受监管代码。
@@ -17,7 +17,7 @@ DeepSeek Harness 仍处于 developer preview。升级 Harness 或 Pi 前，应�
 
 ```text
 Root Agent 的 pi_review_diff 调用
-  -> 固定 argv 的 Git 快照（HEAD/base/diff SHA-256）
+  -> 固定 argv 的 Git 快照（HEAD/base/merge-base/commit/diff SHA-256）
   -> Harness read-only sandbox
   -> 独立 Node Worker + Pi SDK in-memory Session
   -> read / grep / find / ls / review_diff / submit_review
@@ -25,7 +25,7 @@ Root Agent 的 pi_review_diff 调用
   -> 宿主复算快照并标记 stale
 ```
 
-插件没有开放 Pi 的 `bash`、`write`、`edit`、扩展、Skill、Prompt 模板、上下文文件或持久化 Session。Pi 只能读取快照中的当前变更文件；删除文件和重命名旧路径只能通过固定 diff 审查。高危 finding 是成功的业务结果，不会被误报成工具故障。
+插件没有开放 Pi 的 `bash`、`write`、`edit`、扩展、Skill、Prompt 模板、上下文文件或持久化 Session。Pi 只能读取快照中的当前变更文件；`staged`、`branch` 和 `commit` 是 frozen-only scope，只能读取固定 diff。删除文件和重命名旧路径也只能通过固定 diff 审查。高危 finding 是成功的业务结果，不会被误报成工具故障。
 
 ## 安装
 
@@ -79,6 +79,9 @@ npx -y @earendil-works/pi-coding-agent@0.84.2
       config:
         authority: direct-human
         model: kimi-coding/k3
+        modelProfiles:
+          fast: kimi-coding/k3
+          deep: openai/gpt-5.3-codex
         thinkingLevel: high
         timeoutMs: 300000
         maxDiffBytes: 524288
@@ -101,7 +104,7 @@ forwardEnvironment:
   - MY_MODEL_API_KEY
 ```
 
-例如，可在 `auth.json` 使用 `"key": "$MY_MODEL_API_KEY"`，再只转发 `MY_MODEL_API_KEY`。Worker 固定设置 `PI_OFFLINE=1`，关闭 Pi 的启动更新、包更新和遥测网络操作；模型请求本身仍需要访问所配置的 Provider。Windows 上当前仍可使用内置 Pi 模型和认证，但 v0.1 不加载自定义 `models.json`。
+例如，可在 `auth.json` 使用 `"key": "$MY_MODEL_API_KEY"`，再只转发 `MY_MODEL_API_KEY`。Worker 固定设置 `PI_OFFLINE=1`，关闭 Pi 的启动更新、包更新和遥测网络操作；模型请求本身仍需要访问所配置的 Provider。Windows 上当前仍可使用内置 Pi 模型和认证，但 v0.2 不加载自定义 `models.json`。
 
 ## 使用
 
@@ -109,7 +112,7 @@ forwardEnvironment:
 
 ```text
 请调用 pi_review_diff，以 working-tree 范围审查当前仓库全部未提交改动，
-按严重度汇总 finding，并明确结果是否 stale。
+重点检查并发与错误处理，只返回 high 及以上 finding，并明确结果是否 stale。
 ```
 
 工具参数：
@@ -120,16 +123,24 @@ forwardEnvironment:
 | `scope: staged` | index 相对 `HEAD` 的已暂存改动，不包含 untracked 文件；为避免混入未暂存内容，只开放冻结 diff，不开放当前文件读取/搜索 |
 | `scope: working-tree` | 整个工作区相对 `HEAD`，包含 staged、unstaged 与 untracked 文件 |
 | `scope: base` | 工作区相对解析后的 `base_ref` commit；必须提供 `base_ref` |
-| `paths` | 可选、非空的仓库相对路径过滤列表 |
+| `scope: branch` | `base_ref` 与 `head_ref`（默认 `HEAD`）唯一 merge base 到 head 的提交差异；不包含 index、worktree 或 untracked 内容 |
+| `scope: commit` | `commit_ref`（默认 `HEAD`）相对其唯一父提交的差异；root commit 和 merge commit fail closed |
+| `paths` | 可选、非空的仓库相对路径过滤列表；只缩小所选 diff，不会读取任意未修改文件 |
+| `focus` | 可选、最多 2048 UTF-8 bytes 的本次审查重点；不能改变权限、工具、scope 或 Sandbox |
+| `severity_floor` | 返回 finding 的最低严重度：`critical`、`high`、`medium` 或 `low`，默认 `low` |
+| `model_profile` | 可选的部署级模型别名；必须在 `modelProfiles` 中预先映射，未知别名会在 Git/Worker/Provider 启动前失败 |
 
-`base_ref` 只接受普通 ref 或对象 ID，不接受 `HEAD~2`、`A..B` 等 revision expression。它会先解析为不可变 commit，再执行与当前工作区的比较；本版本不会自动计算 merge base。
+`base_ref`、`head_ref` 和 `commit_ref` 只接受普通 ref 或对象 ID，不接受 `HEAD~2`、`A..B` 等 revision expression。每个 ref 都先解析为不可变 commit。`branch` 要求 `git merge-base --all` 恰好返回一个结果；无共同祖先或多个最佳 merge base 都会失败，绝不回退到未经证明的比较基准。
+
+Pi 必须先提交所有通过严格结构、路径、side 与 line 校验的 actionable findings；Host 再确定性应用 `severity_floor`。如果只发现低于阈值的问题，结果是 `below-threshold-only`，不会误称为 `clean`。
 
 成功结果包含：
 
-- `verdict`: `clean` 或 `findings`
-- `assessment` 与按严重度排序的结构化 `findings`
+- `verdict`: `clean`、`findings` 或 `below-threshold-only`
+- `assessment` 与按严重度排序、带 `category` 的结构化 `findings`
 - `snapshot.head`、可选 `base`、`diffHash`、变更路径与 `stale`
-- 实际沙箱 enforcement、Pi 模型 ID 与耗时
+- `policy.severityFloor`、可选 `focus` 与被抑制 finding 数
+- 实际沙箱 enforcement、Provider/模型、input/output/cache token、Pi 估算成本与耗时
 
 若审查期间仓库发生变化，插件仍返回冻结快照上的结果，但把 `snapshot.stale` 标为 `true`；应在新快照上重新审查。
 
@@ -139,6 +150,7 @@ forwardEnvironment:
 | --- | --- | --- |
 | `authority` | `direct-human` | 只允许由当前顶层人类消息驱动；`root-turn` 可放行插件/定时来源的顶层轮次 |
 | `model` | Pi 当前可用默认模型 | 可选的 `provider/model-id` |
+| `modelProfiles` | `{}` | 允许本次调用选择的别名到精确 `provider/model-id` 映射；默认关闭逐次模型选择 |
 | `thinkingLevel` | `high` | `off` 至 `xhigh` |
 | `timeoutMs` | `300000` | 整个快照与审查事务的截止时间 |
 | `maxDiffBytes` | `524288` | diff 上限；超限直接失败，不截断 |
@@ -150,17 +162,18 @@ forwardEnvironment:
 | `agentDir` | `~/.pi/agent` | 可选绝对 Pi 配置目录 |
 | `forwardEnvironment` | `[]` | 显式传给 Worker 的环境变量名 |
 
-`authority: root-turn` 会让 Cron、Plugin 等非人类来源的顶层轮次也能触发审查，适用于自动化，但扩大了调用权限。子 Agent、过期 Agent、无活动 driver、空闲状态或已结束轮次仍然不能调用。
+`authority: root-turn` 会让 Cron、Plugin 等非人类来源的顶层轮次也能触发默认模型审查，适用于自动化，但扩大了调用权限。逐次 `model_profile` 选择仍要求同一开放轮次中存在宿主认证的人类输入；自动化如需固定另一模型，应由部署者修改默认 `model`。子 Agent、过期 Agent、无活动 driver、空闲状态或已结束轮次仍然不能调用。
 
 ## 安全边界与限制
 
 - 默认要求 Harness 报告 `full` 的 read-only enforcement；实际 macOS 测试证明 Worker 子进程创建文件会被拒绝。
 - Git 命令使用固定 argv、关闭 pager/textconv/ext-diff/交互提示、lazy fetch 与 ambient trace/SSH/helper 控制变量，并对路径、ref、输出字节数与文件数 fail-closed。
-- v0.1 只支持带物理 `.git/` 目录的独立普通 worktree；linked worktree、`.git` indirection file、`commondir`、object alternates 和仓库级 clean/process/smudge filter 配置会在获取 diff 前被拒绝。普通 `.git/` 元数据属于宿主信任边界，工作树内容仍按不可信数据处理。
-- 会从 live worktree 进入审查的 tracked/untracked 当前路径必须是稳定、单链接的普通文件；符号链接、硬链接、submodule 和其他特殊文件会被拒绝。`staged` 审查不会打开 live worktree 文件，以免把同路径的未暂存内容带入模型请求。
+- v0.2 只支持带物理 `.git/` 目录的独立普通 worktree；linked worktree、`.git` indirection file、`commondir`、object alternates 和仓库级 clean/process/smudge filter 配置会在获取 diff 前被拒绝。普通 `.git/` 元数据属于宿主信任边界，工作树内容仍按不可信数据处理。
+- 会从 live worktree 进入审查的 tracked/untracked 当前路径必须是稳定、单链接的普通文件；符号链接、硬链接、submodule 和其他特殊文件会被拒绝。`staged`、`branch` 与 `commit` 审查不会打开 live worktree 文件，以免把快照外内容带入模型请求。
 - Worker 只使用内存 Session，严格校验单个 stdin 请求、单个 stdout envelope、diff SHA-256、finding 路径/side/line 和输出大小。
 - 仓库内容被视为不可信数据，并有 prompt-injection 指令隔离；LLM 仍可能犯错，finding 必须由人复核。
 - 当前文件读取仅覆盖变更路径，可能漏掉依赖于未变更文件的跨文件缺陷。
+- 插件不提供任意完整文件审查：让模型自行选择未修改文件会扩大外部 Provider 数据披露权限；这需要独立的显式路径授权设计。
 - 二进制路径不开放额外文件读取；模型只能依据 Git binary patch/元数据，不能完成语义级二进制审计。
 - 需要至少一个有效 `HEAD` commit；全新且尚未提交的仓库会失败。
 - 只读沙箱不阻止模型网络请求，也不保证 Provider 不保留输入。数据治理取决于所选 Provider。

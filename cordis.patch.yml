@@ -3,6 +3,7 @@
       name: '@charlesqin/dsh-pi-review'
       config:
         authority: direct-human
+        modelProfiles: {}
         thinkingLevel: high
         timeoutMs: 300000
         maxDiffBytes: 524288

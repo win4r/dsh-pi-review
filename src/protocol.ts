@@ -2,6 +2,7 @@
 
 import { isAbsolute } from 'node:path'
 import {
+  REVIEW_CATEGORIES,
   REVIEW_CONFIDENCES,
   REVIEW_PROTOCOL_VERSION,
   REVIEW_SCOPES,
@@ -9,6 +10,7 @@ import {
   type ChangedPath,
   type GitSnapshot,
   type ReviewFinding,
+  type ReviewUsage,
   type WorkerEnvelope,
   type WorkerRequest,
   type WorkerReviewResult,
@@ -17,6 +19,11 @@ import {
 const MAX_CHANGED_PATHS = 2_000
 const MAX_FINDINGS = 100
 const MAX_DIFF_BYTES = 16_777_216
+const MAX_FOCUS_BYTES = 2_048
+const MAX_USAGE_TURNS = 10_000
+const MAX_USAGE_BUCKET_TOKENS = 1_000_000_000_000
+const MAX_USAGE_TOTAL_TOKENS = MAX_USAGE_BUCKET_TOKENS * 4
+const MAX_ESTIMATED_COST_USD = 1_000_000
 
 /** Process protocol validation failure safe to expose without input contents. */
 export class ProtocolError extends Error {
@@ -69,6 +76,13 @@ function nonNegativeInteger(value: unknown, label: string, maximum = Number.MAX_
     throw new ProtocolError(`${label} must be a non-negative safe integer no greater than ${String(maximum)}`)
   }
   return value as number
+}
+
+function nonNegativeFiniteNumber(value: unknown, label: string, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > maximum) {
+    throw new ProtocolError(`${label} must be a finite non-negative number no greater than ${String(maximum)}`)
+  }
+  return value
 }
 
 function pathText(value: unknown, label: string): string {
@@ -137,15 +151,38 @@ function parseSnapshot(value: unknown): GitSnapshot {
 /** Parse one Worker request after JSON decoding. */
 export function parseWorkerRequest(value: unknown): WorkerRequest {
   const request = record(value, 'request')
-  exactKeys(request, ['protocolVersion', 'snapshot', 'model', 'thinkingLevel', 'timeoutMs', 'agentDir'], 'request')
+  exactKeys(request, [
+    'protocolVersion',
+    'snapshot',
+    'model',
+    'focus',
+    'severityFloor',
+    'thinkingLevel',
+    'timeoutMs',
+    'agentDir',
+  ], 'request')
   if (request.protocolVersion !== REVIEW_PROTOCOL_VERSION) throw new ProtocolError('unsupported review protocol version')
   const model = optionalText(request.model, 'request.model', 512)
+  if (model !== undefined) {
+    const separator = model.indexOf('/')
+    if (separator < 1 || separator === model.length - 1 || /[\u0000-\u001f\u007f]/.test(model)) {
+      throw new ProtocolError('request.model must use a bounded provider/model-id value')
+    }
+  }
+  const focusValue = optionalText(request.focus, 'request.focus', MAX_FOCUS_BYTES)
+  const focus = focusValue?.trim()
+  if (focus !== undefined && (Buffer.byteLength(focus, 'utf8') > MAX_FOCUS_BYTES
+    || /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(focus))) {
+    throw new ProtocolError('request.focus must be bounded text without unsafe control characters')
+  }
   const agentDir = optionalText(request.agentDir, 'request.agentDir', 16_384)
   if (agentDir !== undefined && !isAbsolute(agentDir)) throw new ProtocolError('request.agentDir must be absolute')
   return {
     protocolVersion: REVIEW_PROTOCOL_VERSION,
     snapshot: parseSnapshot(request.snapshot),
     ...(model === undefined ? {} : { model }),
+    ...(focus === undefined ? {} : { focus }),
+    severityFloor: enumValue(request.severityFloor, REVIEW_SEVERITIES, 'request.severityFloor'),
     thinkingLevel: enumValue(request.thinkingLevel, ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const, 'request.thinkingLevel'),
     timeoutMs: positiveInteger(request.timeoutMs, 'request.timeoutMs', 3_600_000),
     ...(agentDir === undefined ? {} : { agentDir }),
@@ -155,11 +192,12 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
 function parseFinding(value: unknown, index: number): ReviewFinding {
   const label = `result.findings[${String(index)}]`
   const finding = record(value, label)
-  exactKeys(finding, ['severity', 'confidence', 'path', 'side', 'line', 'title', 'evidence', 'impact', 'suggestion'], label)
+  exactKeys(finding, ['severity', 'category', 'confidence', 'path', 'side', 'line', 'title', 'evidence', 'impact', 'suggestion'], label)
   const line = finding.line === undefined ? undefined : positiveInteger(finding.line, `${label}.line`)
   const suggestion = optionalText(finding.suggestion, `${label}.suggestion`, 8_000)
   return {
     severity: enumValue(finding.severity, REVIEW_SEVERITIES, `${label}.severity`),
+    category: enumValue(finding.category, REVIEW_CATEGORIES, `${label}.category`),
     confidence: enumValue(finding.confidence, REVIEW_CONFIDENCES, `${label}.confidence`),
     path: pathText(finding.path, `${label}.path`),
     side: enumValue(finding.side, ['old', 'new'] as const, `${label}.side`),
@@ -171,16 +209,61 @@ function parseFinding(value: unknown, index: number): ReviewFinding {
   }
 }
 
+function parseReviewUsage(value: unknown): ReviewUsage {
+  const usage = record(value, 'result.usage')
+  exactKeys(usage, [
+    'reported',
+    'turns',
+    'inputTokens',
+    'outputTokens',
+    'cacheReadTokens',
+    'cacheWriteTokens',
+    'totalTokens',
+    'estimatedCostUsd',
+  ], 'result.usage')
+  if (typeof usage.reported !== 'boolean') throw new ProtocolError('result.usage.reported must be boolean')
+  const turns = nonNegativeInteger(usage.turns, 'result.usage.turns', MAX_USAGE_TURNS)
+  const inputTokens = nonNegativeInteger(usage.inputTokens, 'result.usage.inputTokens', MAX_USAGE_BUCKET_TOKENS)
+  const outputTokens = nonNegativeInteger(usage.outputTokens, 'result.usage.outputTokens', MAX_USAGE_BUCKET_TOKENS)
+  const cacheReadTokens = nonNegativeInteger(usage.cacheReadTokens, 'result.usage.cacheReadTokens', MAX_USAGE_BUCKET_TOKENS)
+  const cacheWriteTokens = nonNegativeInteger(usage.cacheWriteTokens, 'result.usage.cacheWriteTokens', MAX_USAGE_BUCKET_TOKENS)
+  const totalTokens = nonNegativeInteger(usage.totalTokens, 'result.usage.totalTokens', MAX_USAGE_TOTAL_TOKENS)
+  const expectedTotal = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+  if (totalTokens !== expectedTotal) {
+    throw new ProtocolError('result.usage.totalTokens must equal the sum of its token buckets')
+  }
+  const estimatedCostUsd = nonNegativeFiniteNumber(
+    usage.estimatedCostUsd,
+    'result.usage.estimatedCostUsd',
+    MAX_ESTIMATED_COST_USD,
+  )
+  if (!usage.reported && (turns !== 0 || totalTokens !== 0 || estimatedCostUsd !== 0)) {
+    throw new ProtocolError('result.usage must be all-zero when usage was not reported')
+  }
+  return {
+    reported: usage.reported,
+    turns,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    estimatedCostUsd,
+  }
+}
+
 function parseReviewResult(value: unknown): WorkerReviewResult {
   const result = record(value, 'result')
-  exactKeys(result, ['assessment', 'findings', 'model', 'durationMs'], 'result')
+  exactKeys(result, ['assessment', 'findings', 'provider', 'model', 'usage', 'durationMs'], 'result')
   if (!Array.isArray(result.findings) || result.findings.length > MAX_FINDINGS) {
     throw new ProtocolError(`result.findings must contain at most ${String(MAX_FINDINGS)} items`)
   }
   return {
     assessment: text(result.assessment, 'result.assessment', 12_000),
     findings: result.findings.map(parseFinding),
+    provider: text(result.provider, 'result.provider', 256),
     model: text(result.model, 'result.model', 512),
+    usage: parseReviewUsage(result.usage),
     durationMs: nonNegativeInteger(result.durationMs, 'result.durationMs', 3_600_000),
   }
 }

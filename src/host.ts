@@ -13,15 +13,19 @@ import { requireReviewAuthority } from './authority.ts'
 import {
   captureGitSnapshot,
   normalizeSnapshotRequest,
+  type GitSnapshotRequest,
   type ProcessTracker,
 } from './git.ts'
 import { parseWorkerEnvelope, ProtocolError } from './protocol.ts'
 import {
   REVIEW_PROTOCOL_VERSION,
+  REVIEW_CATEGORIES,
   REVIEW_SCOPES,
+  REVIEW_SEVERITIES,
   type GitSnapshot,
   type ReviewFinding,
   type ReviewResult,
+  type ReviewSeverity,
   type WorkerRequest,
 } from './types.ts'
 
@@ -30,7 +34,7 @@ const REVIEW_OUTPUT_SCHEMA = {
   additionalProperties: false,
   properties: {
     status: { type: 'string', required: true, const: 'completed' },
-    verdict: { type: 'string', required: true, enum: ['clean', 'findings'] },
+    verdict: { type: 'string', required: true, enum: ['clean', 'findings', 'below-threshold-only'] },
     assessment: { type: 'string', required: true },
     findings: {
       type: 'array',
@@ -40,6 +44,7 @@ const REVIEW_OUTPUT_SCHEMA = {
         additionalProperties: false,
         properties: {
           severity: { type: 'string', required: true, enum: ['critical', 'high', 'medium', 'low'] },
+          category: { type: 'string', required: true, enum: REVIEW_CATEGORIES },
           confidence: { type: 'string', required: true, enum: ['high', 'medium', 'low'] },
           path: { type: 'string', required: true },
           side: { type: 'string', required: true, enum: ['old', 'new'] },
@@ -88,7 +93,33 @@ const REVIEW_OUTPUT_SCHEMA = {
         enforcement: { type: 'string', required: true, enum: ['full', 'partial'] },
       },
     },
+    policy: {
+      type: 'object',
+      required: true,
+      additionalProperties: false,
+      properties: {
+        severityFloor: { type: 'string', required: true, enum: REVIEW_SEVERITIES },
+        focus: { type: 'string' },
+        suppressedBelowFloor: { type: 'integer', required: true },
+      },
+    },
+    provider: { type: 'string', required: true },
     model: { type: 'string', required: true },
+    usage: {
+      type: 'object',
+      required: true,
+      additionalProperties: false,
+      properties: {
+        reported: { type: 'boolean', required: true },
+        turns: { type: 'integer', required: true },
+        inputTokens: { type: 'integer', required: true },
+        outputTokens: { type: 'integer', required: true },
+        cacheReadTokens: { type: 'integer', required: true },
+        cacheWriteTokens: { type: 'integer', required: true },
+        totalTokens: { type: 'integer', required: true },
+        estimatedCostUsd: { type: 'number', required: true },
+      },
+    },
     durationMs: { type: 'integer', required: true },
   },
 } as const
@@ -112,7 +143,7 @@ function completeOutput(
 function renderFinding(finding: ReviewFinding, index: number): string {
   const location = `${finding.path}${finding.line === undefined ? '' : `:${String(finding.line)}`} (${finding.side})`
   return [
-    `${String(index + 1)}. [${finding.severity.toUpperCase()}/${finding.confidence}] ${location} — ${finding.title}`,
+    `${String(index + 1)}. [${finding.severity.toUpperCase()}/${finding.category}/${finding.confidence}] ${location} — ${finding.title}`,
     `   Evidence: ${finding.evidence}`,
     `   Impact: ${finding.impact}`,
     ...(finding.suggestion === undefined ? [] : [`   Suggestion: ${finding.suggestion}`]),
@@ -121,10 +152,20 @@ function renderFinding(finding: ReviewFinding, index: number): string {
 
 /** Complete, bounded Native rendering; protocol and stdout caps own the bound. */
 export function renderReviewResult(value: ReviewResult): string {
-  const header = `Pi review ${value.verdict === 'clean' ? 'found no actionable defects' : `returned ${String(value.findings.length)} finding(s)`}.`
+  const header = value.verdict === 'clean'
+    ? 'Pi review found no actionable defects.'
+    : value.verdict === 'below-threshold-only'
+      ? `Pi review found only ${String(value.policy.suppressedBelowFloor)} finding(s) below the requested severity floor.`
+      : `Pi review returned ${String(value.findings.length)} finding(s).`
   const snapshot = `Snapshot ${value.snapshot.diffHash}${value.snapshot.stale ? ' (STALE: repository changed during review)' : ''}; sandbox ${value.sandbox.enforcement}.`
-  if (value.findings.length === 0) return `${header}\n${snapshot}\n\n${value.assessment}`
-  return `${header}\n${snapshot}\n\n${value.assessment}\n\n${value.findings.map(renderFinding).join('\n\n')}`
+  const policy = `Severity floor ${value.policy.severityFloor}; suppressed ${String(value.policy.suppressedBelowFloor)} below-floor finding(s).`
+  const usage = value.usage.reported
+    ? `Pi usage: ${String(value.usage.inputTokens)} input, ${String(value.usage.outputTokens)} output, `
+      + `${String(value.usage.cacheReadTokens)} cache-read, ${String(value.usage.cacheWriteTokens)} cache-write token(s); `
+      + `estimated $${value.usage.estimatedCostUsd.toFixed(6)}; ${String(value.durationMs)} ms; model ${value.model} (provider ${value.provider}).`
+    : `Pi usage was unavailable; ${String(value.durationMs)} ms; model ${value.model} (provider ${value.provider}).`
+  if (value.findings.length === 0) return `${header}\n${snapshot}\n${policy}\n${usage}\n\n${value.assessment}`
+  return `${header}\n${snapshot}\n${policy}\n${usage}\n\n${value.assessment}\n\n${value.findings.map(renderFinding).join('\n\n')}`
 }
 
 function forwardedEnvironment(config: ResolvedConfig): NodeJS.ProcessEnv {
@@ -140,6 +181,100 @@ function forwardedEnvironment(config: ResolvedConfig): NodeJS.ProcessEnv {
   env.NO_COLOR = '1'
   env.PI_OFFLINE = '1'
   return env
+}
+
+export interface NormalizedReviewCall {
+  readonly snapshot: GitSnapshotRequest
+  readonly focus?: string
+  readonly severityFloor: ReviewSeverity
+  readonly model?: string
+  readonly modelProfileSelected: boolean
+}
+
+/** Close and normalize the complete model-facing call before Git or Pi starts. */
+export function normalizeReviewCall(
+  rawArgs: Record<string, unknown>,
+  config: ResolvedConfig,
+): NormalizedReviewCall {
+  const allowed = new Set([
+    'scope',
+    'base_ref',
+    'head_ref',
+    'commit_ref',
+    'paths',
+    'focus',
+    'severity_floor',
+    'model_profile',
+  ])
+  if (Object.keys(rawArgs).some(key => !allowed.has(key))) {
+    throw new HarnessError('pi_review_diff received unsupported arguments', 'PI_REVIEW_INVALID_ARGS')
+  }
+
+  const snapshotFields = ['scope', 'base_ref', 'head_ref', 'commit_ref', 'paths'] as const
+  const snapshotArgs: Record<string, unknown> = {}
+  for (const key of snapshotFields) {
+    if (rawArgs[key] !== undefined) snapshotArgs[key] = rawArgs[key]
+  }
+  const snapshot = normalizeSnapshotRequest(snapshotArgs)
+
+  const rawFocus = rawArgs['focus']
+  let focus: string | undefined
+  if (rawFocus !== undefined) {
+    if (typeof rawFocus !== 'string') {
+      throw new HarnessError('focus must be a string', 'PI_REVIEW_INVALID_ARGS')
+    }
+    focus = rawFocus.trim()
+    if (focus.length === 0 || Buffer.byteLength(focus, 'utf8') > 2_048
+      || /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(focus)) {
+      throw new HarnessError('focus must be non-empty, bounded text without unsafe control characters', 'PI_REVIEW_INVALID_ARGS')
+    }
+  }
+
+  const rawFloor = rawArgs['severity_floor']
+  const severityFloor = rawFloor ?? 'low'
+  if (typeof severityFloor !== 'string'
+    || !(REVIEW_SEVERITIES as readonly string[]).includes(severityFloor)) {
+    throw new HarnessError('severity_floor is invalid', 'PI_REVIEW_INVALID_ARGS')
+  }
+
+  const rawProfile = rawArgs['model_profile']
+  let model = config.model
+  let modelProfileSelected = false
+  if (rawProfile !== undefined) {
+    if (typeof rawProfile !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(rawProfile)) {
+      throw new HarnessError('model_profile is invalid', 'PI_REVIEW_INVALID_ARGS')
+    }
+    if (!Object.prototype.hasOwnProperty.call(config.modelProfiles, rawProfile)) {
+      throw new HarnessError(
+        'model_profile is not enabled by the deployment',
+        'PI_REVIEW_MODEL_PROFILE_NOT_ALLOWED',
+      )
+    }
+    model = config.modelProfiles[rawProfile]
+    modelProfileSelected = true
+  }
+
+  return {
+    snapshot,
+    ...(focus === undefined ? {} : { focus }),
+    severityFloor: severityFloor as ReviewSeverity,
+    ...(model === undefined ? {} : { model }),
+    modelProfileSelected,
+  }
+}
+
+const SEVERITY_RANK: Readonly<Record<ReviewSeverity, number>> = {
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1,
+}
+
+function findingsAtOrAbove(
+  findings: readonly ReviewFinding[],
+  floor: ReviewSeverity,
+): readonly ReviewFinding[] {
+  return findings.filter(finding => SEVERITY_RANK[finding.severity] >= SEVERITY_RANK[floor])
 }
 
 function findingsStayInSnapshot(snapshot: GitSnapshot, findings: readonly ReviewFinding[]): boolean {
@@ -160,7 +295,8 @@ function findingsStayInSnapshot(snapshot: GitSnapshot, findings: readonly Review
 }
 
 export function sameSnapshot(left: GitSnapshot, right: GitSnapshot): boolean {
-  return left.repoRoot === right.repoRoot
+  return left.scope === right.scope
+    && left.repoRoot === right.repoRoot
     && left.head === right.head
     && left.base === right.base
     && left.diffHash === right.diffHash
@@ -230,17 +366,24 @@ export class ReviewHost implements ProcessTracker {
 
   async #reviewTransaction(rawArgs: Record<string, unknown>, exec: ToolRunContext): Promise<ReviewResult> {
     const authority = requireReviewAuthority(this.ctx, exec, this.config.authority)
-    const request = normalizeSnapshotRequest(rawArgs)
+    const call = normalizeReviewCall(rawArgs, this.config)
+    // Selecting a non-default Provider destination is a same-turn human
+    // decision even when the deployment otherwise admits root-turn automation.
+    if (call.modelProfileSelected && this.config.authority !== 'direct-human') {
+      requireReviewAuthority(this.ctx, exec, 'direct-human')
+    }
     const deadline = AbortSignal.timeout(this.config.timeoutMs)
     const signal = AbortSignal.any([exec.signal, deadline, this.#lifecycle.signal])
     try {
       const snapshot = await captureGitSnapshot(
-        this.ctx, authority.cwd, request, this.config, signal, this,
+        this.ctx, authority.cwd, call.snapshot, this.config, signal, this,
       )
       const workerRequest: WorkerRequest = {
         protocolVersion: REVIEW_PROTOCOL_VERSION,
         snapshot,
-        ...(this.config.model === undefined ? {} : { model: this.config.model }),
+        ...(call.model === undefined ? {} : { model: call.model }),
+        ...(call.focus === undefined ? {} : { focus: call.focus }),
+        severityFloor: call.severityFloor,
         thinkingLevel: this.config.thinkingLevel,
         timeoutMs: this.config.timeoutMs,
         ...(this.config.agentDir === undefined ? {} : { agentDir: this.config.agentDir }),
@@ -321,11 +464,13 @@ export class ReviewHost implements ProcessTracker {
       if (!findingsStayInSnapshot(snapshot, envelope.result.findings)) {
         throw new HarnessError('Pi Worker reported a finding outside the captured changes', 'PI_REVIEW_WORKER_PROTOCOL')
       }
+      const findings = findingsAtOrAbove(envelope.result.findings, call.severityFloor)
+      const suppressedBelowFloor = envelope.result.findings.length - findings.length
 
       let stale = false
       try {
         const current = await captureGitSnapshot(
-          this.ctx, authority.cwd, request, this.config, signal, this,
+          this.ctx, authority.cwd, call.snapshot, this.config, signal, this,
         )
         stale = !sameSnapshot(snapshot, current)
       } catch (error: unknown) {
@@ -335,9 +480,13 @@ export class ReviewHost implements ProcessTracker {
       }
       return {
         status: 'completed',
-        verdict: envelope.result.findings.length === 0 ? 'clean' : 'findings',
+        verdict: envelope.result.findings.length === 0
+          ? 'clean'
+          : findings.length === 0
+            ? 'below-threshold-only'
+            : 'findings',
         assessment: envelope.result.assessment,
-        findings: envelope.result.findings,
+        findings,
         snapshot: {
           scope: snapshot.scope,
           head: snapshot.head,
@@ -348,7 +497,14 @@ export class ReviewHost implements ProcessTracker {
           stale,
         },
         sandbox: { mode: 'read-only', enforcement: confined.enforcement },
+        policy: {
+          severityFloor: call.severityFloor,
+          ...(call.focus === undefined ? {} : { focus: call.focus }),
+          suppressedBelowFloor,
+        },
+        provider: envelope.result.provider,
         model: envelope.result.model,
+        usage: envelope.result.usage,
         durationMs: envelope.result.durationMs,
       }
     } catch (error: unknown) {
@@ -371,23 +527,45 @@ export function createReviewTool(host: ReviewHost): ToolDefinition {
   const typed = defineTool({
     name: 'pi_review_diff',
     description: 'Run an isolated, read-only Pi Agent review of the calling root Agent\'s Git changes. '
-      + 'Choose unstaged, staged, the complete working tree, or comparison with one validated base ref. '
+      + 'Choose unstaged, staged, the complete working tree, comparison with a base ref, '
+      + 'a merge-base branch comparison, or one ordinary single-parent commit. '
       + 'Returns structured findings; critical/high findings are successful review results, not tool failures.',
     parameters: {
       scope: {
         type: 'string',
         required: true,
         enum: REVIEW_SCOPES,
-        description: 'unstaged | staged | working-tree | base',
+        description: 'unstaged | staged | working-tree | base | branch | commit',
       },
       base_ref: {
         type: 'string',
-        description: 'Required only for base scope. Ordinary ref name or object id; revision expressions are rejected.',
+        description: 'Required for base and branch scopes. Ordinary ref name or object id; revision expressions are rejected.',
+      },
+      head_ref: {
+        type: 'string',
+        description: 'Optional branch head for branch scope; defaults to HEAD.',
+      },
+      commit_ref: {
+        type: 'string',
+        description: 'Optional commit target for commit scope; defaults to HEAD. Root and merge commits are rejected.',
       },
       paths: {
         type: 'array',
         items: { type: 'string' },
         description: 'Optional non-empty repository-relative path filters.',
+      },
+      focus: {
+        type: 'string',
+        description: 'Optional bounded review emphasis. It cannot change authority, scope, tools, or sandbox policy.',
+      },
+      severity_floor: {
+        type: 'string',
+        enum: REVIEW_SEVERITIES,
+        description: 'Lowest finding severity returned by the host; defaults to low.',
+      },
+      model_profile: {
+        type: 'string',
+        description: 'Optional deployment-defined model profile. Unknown profiles fail before Git or Provider access.',
       },
     },
     output: {

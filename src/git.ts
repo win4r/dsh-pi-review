@@ -51,6 +51,8 @@ function gitTraceTombstones(): Record<string, undefined> {
 export interface GitSnapshotRequest {
   readonly scope: ReviewScope
   readonly baseRef?: string
+  readonly headRef?: string
+  readonly commitRef?: string
   readonly paths?: readonly string[]
 }
 
@@ -266,25 +268,62 @@ export function validateBaseRef(value: string): string {
   return value
 }
 
+/** Apply the same strict ref grammar to branch heads and commit selectors. */
+function validateReviewRef(value: string, field: 'head_ref' | 'commit_ref'): string {
+  try {
+    return validateBaseRef(value)
+  } catch (error: unknown) {
+    if (error instanceof GitSnapshotError) {
+      throw new GitSnapshotError(
+        `${field} must be an ordinary Git ref name or object id, not a revision expression`,
+        'PI_REVIEW_INVALID_REF',
+        { cause: error },
+      )
+    }
+    throw error
+  }
+}
+
 /** Enforce the exact closed request surface even though defineTool's implicit root is open. */
 export function normalizeSnapshotRequest(value: Record<string, unknown>): GitSnapshotRequest {
-  const allowed = new Set(['scope', 'base_ref', 'paths'])
+  const allowed = new Set(['scope', 'base_ref', 'head_ref', 'commit_ref', 'paths'])
   if (Object.keys(value).some(key => !allowed.has(key))) {
     throw new GitSnapshotError('pi_review_diff received unsupported arguments', 'PI_REVIEW_INVALID_ARGS')
   }
   const scope = value['scope']
-  if (scope !== 'unstaged' && scope !== 'staged' && scope !== 'working-tree' && scope !== 'base') {
+  if (scope !== 'unstaged' && scope !== 'staged' && scope !== 'working-tree'
+    && scope !== 'base' && scope !== 'branch' && scope !== 'commit') {
     throw new GitSnapshotError('scope is invalid', 'PI_REVIEW_INVALID_ARGS')
   }
   const suppliedBase = value['base_ref']
-  if (scope === 'base') {
+  const suppliedHead = value['head_ref']
+  const suppliedCommit = value['commit_ref']
+  if (scope === 'base' || scope === 'branch') {
     if (typeof suppliedBase !== 'string') {
-      throw new GitSnapshotError('base_ref is required when scope is base', 'PI_REVIEW_INVALID_ARGS')
+      throw new GitSnapshotError(`base_ref is required when scope is ${scope}`, 'PI_REVIEW_INVALID_ARGS')
     }
   } else if (suppliedBase !== undefined) {
-    throw new GitSnapshotError('base_ref is valid only when scope is base', 'PI_REVIEW_INVALID_ARGS')
+    throw new GitSnapshotError('base_ref is valid only when scope is base or branch', 'PI_REVIEW_INVALID_ARGS')
+  }
+  if (scope !== 'branch' && suppliedHead !== undefined) {
+    throw new GitSnapshotError('head_ref is valid only when scope is branch', 'PI_REVIEW_INVALID_ARGS')
+  }
+  if (scope !== 'commit' && suppliedCommit !== undefined) {
+    throw new GitSnapshotError('commit_ref is valid only when scope is commit', 'PI_REVIEW_INVALID_ARGS')
   }
   const baseRef = typeof suppliedBase === 'string' ? validateBaseRef(suppliedBase) : undefined
+  if (suppliedHead !== undefined && typeof suppliedHead !== 'string') {
+    throw new GitSnapshotError('head_ref must be a string when provided', 'PI_REVIEW_INVALID_ARGS')
+  }
+  if (suppliedCommit !== undefined && typeof suppliedCommit !== 'string') {
+    throw new GitSnapshotError('commit_ref must be a string when provided', 'PI_REVIEW_INVALID_ARGS')
+  }
+  const headRef = scope === 'branch'
+    ? validateReviewRef(typeof suppliedHead === 'string' ? suppliedHead : 'HEAD', 'head_ref')
+    : undefined
+  const commitRef = scope === 'commit'
+    ? validateReviewRef(typeof suppliedCommit === 'string' ? suppliedCommit : 'HEAD', 'commit_ref')
+    : undefined
   const suppliedPaths = value['paths']
   if (suppliedPaths !== undefined && (!Array.isArray(suppliedPaths) || suppliedPaths.length === 0)) {
     throw new GitSnapshotError('paths must be a non-empty array when provided', 'PI_REVIEW_INVALID_ARGS')
@@ -302,6 +341,8 @@ export function normalizeSnapshotRequest(value: Record<string, unknown>): GitSna
   return {
     scope,
     ...(baseRef === undefined ? {} : { baseRef }),
+    ...(headRef === undefined ? {} : { headRef }),
+    ...(commitRef === undefined ? {} : { commitRef }),
     ...(paths === undefined ? {} : { paths }),
   }
 }
@@ -443,14 +484,19 @@ function frozenContentPaths(changes: readonly ChangedPath[]): string[] {
   return [...paths]
 }
 
-function diffModeArgs(scope: ReviewScope, base: string | undefined): string[] {
+function diffModeArgs(scope: ReviewScope, base: string | undefined, head: string): string[] {
   switch (scope) {
     case 'unstaged': return []
-    case 'staged': return ['--cached', 'HEAD']
-    case 'working-tree': return ['HEAD']
+    case 'staged': return ['--cached', head]
+    case 'working-tree': return [head]
     case 'base': {
       if (base === undefined) throw new GitSnapshotError('Resolved base commit is missing')
       return [base]
+    }
+    case 'branch':
+    case 'commit': {
+      if (base === undefined) throw new GitSnapshotError('Resolved historical comparison commit is missing')
+      return [base, head]
     }
   }
 }
@@ -465,6 +511,120 @@ function assertObjectId(value: string, label: string): string {
     throw new GitSnapshotError(`Git returned an invalid ${label} object id`)
   }
   return normalized
+}
+
+async function resolveCommitRef(
+  ctx: Context,
+  git: string,
+  repoRoot: string,
+  ref: string,
+  label: string,
+  config: ResolvedConfig,
+  signal: AbortSignal,
+  tracker: ProcessTracker | undefined,
+): Promise<string> {
+  const result = await runGit(
+    ctx,
+    git,
+    repoRoot,
+    ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`],
+    config,
+    signal,
+    tracker,
+    { stdoutMaxBytes: 256 },
+  )
+  return assertObjectId(result.stdout, label)
+}
+
+async function resolveUniqueMergeBase(
+  ctx: Context,
+  git: string,
+  repoRoot: string,
+  base: string,
+  head: string,
+  config: ResolvedConfig,
+  signal: AbortSignal,
+  tracker: ProcessTracker | undefined,
+): Promise<string> {
+  const result = await runGit(
+    ctx,
+    git,
+    repoRoot,
+    ['merge-base', '--all', base, head],
+    config,
+    signal,
+    tracker,
+    { stdoutMaxBytes: 16_384, allowedExitCodes: [0, 1] },
+  )
+  if (result.outcome.exitCode === 1 || result.stdout.length === 0) {
+    throw new GitSnapshotError(
+      'The selected branch refs do not have one common merge base',
+      'PI_REVIEW_MERGE_BASE_UNAVAILABLE',
+    )
+  }
+  if (!result.stdout.endsWith('\n')) {
+    throw new GitSnapshotError('Git merge-base output was not newline-terminated')
+  }
+  const candidates = result.stdout.slice(0, -1).split('\n')
+  if (candidates.length !== 1) {
+    throw new GitSnapshotError(
+      'The selected branch refs have multiple best merge bases',
+      'PI_REVIEW_AMBIGUOUS_MERGE_BASE',
+    )
+  }
+  return assertObjectId(candidates[0] ?? '', 'merge base')
+}
+
+async function resolveSingleCommitParent(
+  ctx: Context,
+  git: string,
+  repoRoot: string,
+  commit: string,
+  config: ResolvedConfig,
+  signal: AbortSignal,
+  tracker: ProcessTracker | undefined,
+): Promise<string> {
+  const firstParent = await runGit(
+    ctx,
+    git,
+    repoRoot,
+    ['rev-parse', '--verify', '--quiet', '--end-of-options', `${commit}^1^{commit}`],
+    config,
+    signal,
+    tracker,
+    { stdoutMaxBytes: 256, allowedExitCodes: [0, 1] },
+  )
+  if (firstParent.outcome.exitCode === 1) {
+    if (firstParent.stdout.length !== 0) {
+      throw new GitSnapshotError('Git returned invalid commit-parent metadata')
+    }
+    throw new GitSnapshotError(
+      'Commit review supports only commits with exactly one parent',
+      'PI_REVIEW_UNSUPPORTED_COMMIT_SHAPE',
+    )
+  }
+  const parent = assertObjectId(firstParent.stdout, 'commit parent')
+  const secondParent = await runGit(
+    ctx,
+    git,
+    repoRoot,
+    ['rev-parse', '--verify', '--quiet', '--end-of-options', `${commit}^2^{commit}`],
+    config,
+    signal,
+    tracker,
+    { stdoutMaxBytes: 256, allowedExitCodes: [0, 1] },
+  )
+  if (secondParent.outcome.exitCode === 0) {
+    assertObjectId(secondParent.stdout, 'second commit parent')
+    throw new GitSnapshotError(
+      'Commit review supports only commits with exactly one parent',
+      'PI_REVIEW_UNSUPPORTED_COMMIT_SHAPE',
+    )
+  }
+  if (secondParent.stdout.length !== 0) {
+    throw new GitSnapshotError('Git returned invalid commit-parent metadata')
+  }
+  return parent
 }
 
 function assertDiffBudget(diff: string, maximum: number): void {
@@ -777,12 +937,15 @@ export async function captureGitSnapshot(
   }
   const git = await ctx.subprocess.resolveExecutable('git', undefined, signal)
 
-  const headRun = await runGit(
-    ctx, git, repoRoot,
-    ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
-    config, signal, tracker, { stdoutMaxBytes: 256 },
-  )
-  const head = assertObjectId(headRun.stdout, 'HEAD')
+  let workspaceHead: string | undefined
+  if (request.scope !== 'branch' && request.scope !== 'commit') {
+    const headRun = await runGit(
+      ctx, git, repoRoot,
+      ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
+      config, signal, tracker, { stdoutMaxBytes: 256 },
+    )
+    workspaceHead = assertObjectId(headRun.stdout, 'HEAD')
+  }
   const filterRun = await runGit(
     ctx, git, repoRoot,
     ['config', '--includes', '--get-regexp', '^filter\\..*\\.(clean|process|smudge|required)$'],
@@ -794,21 +957,60 @@ export async function captureGitSnapshot(
       'PI_REVIEW_GIT_FILTER_UNSAFE',
     )
   }
-  let base: string | undefined
-  if (request.scope === 'base') {
-    if (request.baseRef === undefined) throw new GitSnapshotError('base_ref is required for base scope', 'PI_REVIEW_INVALID_ARGS')
-    const baseRef = validateBaseRef(request.baseRef)
-    const baseRun = await runGit(
-      ctx, git, repoRoot,
-      ['rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`],
-      config, signal, tracker, { stdoutMaxBytes: 256 },
-    )
-    base = assertObjectId(baseRun.stdout, 'base')
-  } else if (request.baseRef !== undefined) {
-    throw new GitSnapshotError('base_ref is valid only for base scope', 'PI_REVIEW_INVALID_ARGS')
+  if (request.scope !== 'branch' && request.headRef !== undefined) {
+    throw new GitSnapshotError('head_ref is valid only for branch scope', 'PI_REVIEW_INVALID_ARGS')
+  }
+  if (request.scope !== 'commit' && request.commitRef !== undefined) {
+    throw new GitSnapshotError('commit_ref is valid only for commit scope', 'PI_REVIEW_INVALID_ARGS')
   }
 
-  const mode = diffModeArgs(request.scope, base)
+  let head = workspaceHead
+  let base: string | undefined
+  let baseScopeRef: string | undefined
+  let baseScopeTip: string | undefined
+  let branchBaseRef: string | undefined
+  let branchHeadRef: string | undefined
+  let branchBaseTip: string | undefined
+  let branchHeadTip: string | undefined
+  let commitRef: string | undefined
+  let commitTip: string | undefined
+  if (request.scope === 'base') {
+    if (request.baseRef === undefined) throw new GitSnapshotError('base_ref is required for base scope', 'PI_REVIEW_INVALID_ARGS')
+    baseScopeRef = validateBaseRef(request.baseRef)
+    baseScopeTip = await resolveCommitRef(
+      ctx, git, repoRoot, baseScopeRef, 'base', config, signal, tracker,
+    )
+    base = baseScopeTip
+  } else if (request.scope === 'branch') {
+    if (request.baseRef === undefined) throw new GitSnapshotError('base_ref is required for branch scope', 'PI_REVIEW_INVALID_ARGS')
+    branchBaseRef = validateBaseRef(request.baseRef)
+    branchHeadRef = validateReviewRef(request.headRef ?? 'HEAD', 'head_ref')
+    branchBaseTip = await resolveCommitRef(
+      ctx, git, repoRoot, branchBaseRef, 'branch base', config, signal, tracker,
+    )
+    branchHeadTip = await resolveCommitRef(
+      ctx, git, repoRoot, branchHeadRef, 'branch head', config, signal, tracker,
+    )
+    base = await resolveUniqueMergeBase(
+      ctx, git, repoRoot, branchBaseTip, branchHeadTip, config, signal, tracker,
+    )
+    head = branchHeadTip
+  } else if (request.scope === 'commit') {
+    if (request.baseRef !== undefined) {
+      throw new GitSnapshotError('base_ref is invalid for commit scope', 'PI_REVIEW_INVALID_ARGS')
+    }
+    commitRef = validateReviewRef(request.commitRef ?? 'HEAD', 'commit_ref')
+    commitTip = await resolveCommitRef(ctx, git, repoRoot, commitRef, 'review commit', config, signal, tracker)
+    base = await resolveSingleCommitParent(ctx, git, repoRoot, commitTip, config, signal, tracker)
+    head = commitTip
+  } else if (request.baseRef !== undefined) {
+    throw new GitSnapshotError('base_ref is valid only for base or branch scope', 'PI_REVIEW_INVALID_ARGS')
+  }
+  if (head === undefined) {
+    throw new GitSnapshotError('Resolved review head is missing')
+  }
+
+  const mode = diffModeArgs(request.scope, base, head)
   const metadataCap = boundedMetadataCap(config.maxFiles)
   const nameRun = await runGit(
     ctx, git, repoRoot,
@@ -826,7 +1028,10 @@ export async function captureGitSnapshot(
     binaryPaths.has(change.path) ? { ...change, binary: true } : change)
   const frozenTrackedChanges = changedPaths
 
-  const includeUntracked = request.scope !== 'staged'
+  const usesLiveWorktree = request.scope !== 'staged'
+    && request.scope !== 'branch'
+    && request.scope !== 'commit'
+  const includeUntracked = usesLiveWorktree
   let untracked: string[] = []
   if (includeUntracked) {
     const untrackedRun = await runGit(
@@ -847,15 +1052,15 @@ export async function captureGitSnapshot(
     )
   }
 
-  // Staged snapshots are frozen from index blobs and never map live files into
-  // the Worker. Every other scope can expose current worktree content through
-  // the patch or scoped reads, so reject hardlink aliases before `--binary`.
+  // Index- and object-backed snapshots never map live files into the Worker.
+  // Live scopes can expose current worktree content through the patch or scoped
+  // reads, so reject hardlink aliases before `--binary`.
   const trackedLiveFiles = new Map<string, LiveWorktreeMetadata>()
   const untrackedLiveFiles = new Map<string, LiveWorktreeMetadata>()
   const missingLivePaths = new Set<string>()
   const guardedDirectories = new Map<string, WorktreeDirectoryMetadata>()
   const directoriesByPath = new Map<string, readonly WorktreeDirectoryMetadata[]>()
-  if (request.scope !== 'staged') {
+  if (usesLiveWorktree) {
     for (const change of changedPaths) {
       if (change.status.startsWith('D')) {
         missingLivePaths.add(change.path)
@@ -1024,13 +1229,59 @@ export async function captureGitSnapshot(
     }
   }
 
-  const finalHeadRun = await runGit(
-    ctx, git, repoRoot,
-    ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
-    config, signal, tracker, { stdoutMaxBytes: 256 },
-  )
-  if (assertObjectId(finalHeadRun.stdout, 'HEAD') !== head) {
-    throw new GitSnapshotError('Repository HEAD changed while the review snapshot was being captured', 'PI_REVIEW_SNAPSHOT_RACED')
+  if (request.scope === 'branch') {
+    if (branchBaseRef === undefined || branchHeadRef === undefined
+      || branchBaseTip === undefined || branchHeadTip === undefined) {
+      throw new GitSnapshotError('Resolved branch review metadata is incomplete')
+    }
+    const finalBaseTip = await resolveCommitRef(
+      ctx, git, repoRoot, branchBaseRef, 'final branch base', config, signal, tracker,
+    )
+    const finalHeadTip = await resolveCommitRef(
+      ctx, git, repoRoot, branchHeadRef, 'final branch head', config, signal, tracker,
+    )
+    if (finalBaseTip !== branchBaseTip || finalHeadTip !== branchHeadTip) {
+      throw new GitSnapshotError(
+        'A branch review ref changed while the snapshot was being captured',
+        'PI_REVIEW_SNAPSHOT_RACED',
+      )
+    }
+  } else if (request.scope === 'commit') {
+    if (commitRef === undefined || commitTip === undefined) {
+      throw new GitSnapshotError('Resolved commit review metadata is incomplete')
+    }
+    const finalCommitTip = await resolveCommitRef(
+      ctx, git, repoRoot, commitRef, 'final review commit', config, signal, tracker,
+    )
+    if (finalCommitTip !== commitTip) {
+      throw new GitSnapshotError(
+        'The commit review ref changed while the snapshot was being captured',
+        'PI_REVIEW_SNAPSHOT_RACED',
+      )
+    }
+  } else {
+    const finalHeadRun = await runGit(
+      ctx, git, repoRoot,
+      ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
+      config, signal, tracker, { stdoutMaxBytes: 256 },
+    )
+    if (assertObjectId(finalHeadRun.stdout, 'HEAD') !== head) {
+      throw new GitSnapshotError('Repository HEAD changed while the review snapshot was being captured', 'PI_REVIEW_SNAPSHOT_RACED')
+    }
+    if (request.scope === 'base') {
+      if (baseScopeRef === undefined || baseScopeTip === undefined) {
+        throw new GitSnapshotError('Resolved base review metadata is incomplete')
+      }
+      const finalBaseTip = await resolveCommitRef(
+        ctx, git, repoRoot, baseScopeRef, 'final base', config, signal, tracker,
+      )
+      if (finalBaseTip !== baseScopeTip) {
+        throw new GitSnapshotError(
+          'The base review ref changed while the snapshot was being captured',
+          'PI_REVIEW_SNAPSHOT_RACED',
+        )
+      }
+    }
   }
 
   return {

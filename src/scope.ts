@@ -19,10 +19,12 @@ import {
   resolve,
   sep,
 } from 'node:path'
-import type {
-  ChangedPath,
-  GitSnapshot,
-  ReviewFinding,
+import {
+  REVIEW_CATEGORIES,
+  type ChangedPath,
+  type GitSnapshot,
+  type ReviewFinding,
+  type ReviewScope as ReviewScopeName,
 } from './types.ts'
 
 /** Source reads are deliberately smaller than the process protocol limit. */
@@ -160,6 +162,7 @@ export class ReviewScope {
   readonly #changedByNewPath: ReadonlyMap<string, ChangedPath>
   readonly #changedByOldPath: ReadonlyMap<string, ChangedPath>
   readonly #inputRepoRoot: string
+  readonly #scope: ReviewScopeName
 
   constructor(snapshot: GitSnapshot) {
     let repoRoot: string
@@ -171,6 +174,8 @@ export class ReviewScope {
     }
 
     const currentFileAccessAllowed = snapshot.scope !== 'staged'
+      && snapshot.scope !== 'branch'
+      && snapshot.scope !== 'commit'
     const changedByNewPath = new Map<string, ChangedPath>()
     const changedByOldPath = new Map<string, ChangedPath>()
     const currentByPath = new Map<string, ScopedCurrentFile>()
@@ -193,9 +198,9 @@ export class ReviewScope {
         if (!changedByOldPath.has(oldPath)) changedByOldPath.set(oldPath, normalizedChanged)
       }
 
-      // A staged snapshot is frozen from the index, while this filesystem is
-      // the live worktree. Never map staged new-side paths to worktree files:
-      // they may contain later unstaged or untracked secrets.
+      // These snapshots are frozen from Git objects or the index, while this
+      // filesystem is the live worktree. Never map their new-side paths to
+      // worktree files: they may contain later local or untracked secrets.
       if (currentFileAccessAllowed && !isDeleted(normalizedChanged)) {
         const file = canonicalFile(repoRoot, path, normalizedChanged.binary === true)
         if (file !== undefined) currentByPath.set(path, file)
@@ -209,6 +214,7 @@ export class ReviewScope {
     this.#changedByNewPath = changedByNewPath
     this.#changedByOldPath = changedByOldPath
     this.#inputRepoRoot = resolve(snapshot.repoRoot)
+    this.#scope = snapshot.scope
   }
 
   /** Revalidate an exact changed current file immediately before access. */
@@ -336,6 +342,9 @@ export class ReviewScope {
     if (!['critical', 'high', 'medium', 'low'].includes(finding.severity)) {
       throw new ScopeError('finding severity is invalid')
     }
+    if (!REVIEW_CATEGORIES.includes(finding.category)) {
+      throw new ScopeError('finding category is invalid')
+    }
     if (!['high', 'medium', 'low'].includes(finding.confidence)) {
       throw new ScopeError('finding confidence is invalid')
     }
@@ -346,6 +355,7 @@ export class ReviewScope {
     const suggestion = finding.suggestion?.trim()
     return {
       severity: finding.severity,
+      category: finding.category,
       confidence: finding.confidence,
       path,
       side: finding.side,
@@ -406,7 +416,7 @@ export class ReviewScope {
 
   #assertCurrentFileAccess(): void {
     if (!this.#currentFileAccessAllowed) {
-      throw new ScopeError('current-file access is unavailable for staged snapshots; use review_diff')
+      throw new ScopeError(`current-file access is unavailable for ${this.#scope} snapshots; use review_diff`)
     }
   }
 

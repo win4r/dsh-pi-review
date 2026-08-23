@@ -16,7 +16,11 @@ import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseWorkerEnvelope } from '../src/protocol.ts'
-import type { WorkerRequest } from '../src/types.ts'
+import {
+  REVIEW_PROTOCOL_VERSION,
+  type ReviewUsage,
+  type WorkerRequest,
+} from '../src/types.ts'
 import {
   createReadOnlyModelRuntime,
   loadReadOnlyCredentials,
@@ -52,7 +56,7 @@ function requestFixture(): WorkerRequest {
     '',
   ].join('\n')
   return {
-    protocolVersion: 1,
+    protocolVersion: REVIEW_PROTOCOL_VERSION,
     snapshot: {
       scope: 'working-tree',
       repoRoot: root,
@@ -62,6 +66,7 @@ function requestFixture(): WorkerRequest {
       changedPaths: [{ status: 'M', path: 'src/changed.ts' }],
       omitted: [],
     },
+    severityFloor: 'low',
     thinkingLevel: 'high',
     timeoutMs: 1_000,
   }
@@ -72,6 +77,7 @@ function submission(overrides: Record<string, unknown> = {}): Record<string, unk
     assessment: 'A concrete defect was found.',
     findings: [{
       severity: 'high',
+      category: 'correctness',
       confidence: 'high',
       path: 'src/changed.ts',
       side: 'new',
@@ -94,19 +100,39 @@ interface SessionProbe {
   aborted: number
   disposed: number
   input?: CreateWorkerSessionInput
+  promptText?: string
+  usage?: ReviewUsage
+}
+
+function usageFixture(overrides: Partial<ReviewUsage> = {}): ReviewUsage {
+  return {
+    reported: true,
+    turns: 2,
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 10,
+    totalTokens: 160,
+    estimatedCostUsd: 0.0125,
+    ...overrides,
+  }
 }
 
 function fakeSessionFactory(
   probe: SessionProbe,
-  prompt: (input: CreateWorkerSessionInput) => Promise<void>,
+  prompt: (input: CreateWorkerSessionInput, text: string) => Promise<void>,
 ): (input: CreateWorkerSessionInput) => Promise<WorkerSession> {
   return async input => {
     probe.input = input
     return {
       model: { provider: 'test-provider', id: 'review-model' },
-      prompt: async () => prompt(input),
+      prompt: async text => {
+        probe.promptText = text
+        return prompt(input, text)
+      },
       abort: async () => { probe.aborted += 1 },
       dispose: () => { probe.disposed += 1 },
+      getSessionStats: () => probe.usage ?? usageFixture(),
       getActiveToolNames: () => input.tools.map(tool => tool.name),
     }
   }
@@ -127,6 +153,7 @@ describe('Pi Worker core', () => {
           findings: [
             {
               severity: 'low',
+              category: 'maintainability',
               confidence: 'medium',
               path: 'src/changed.ts',
               side: 'new',
@@ -149,11 +176,38 @@ describe('Pi Worker core', () => {
     if (envelope.ok) {
       expect(envelope.result.assessment).toBe('Review complete.')
       expect(envelope.result.findings.map(finding => finding.severity)).toEqual(['high', 'low'])
+      expect(envelope.result.provider).toBe('test-provider')
       expect(envelope.result.model).toBe('test-provider/review-model')
+      expect(envelope.result.usage).toEqual(usageFixture())
       expect(envelope.result.durationMs).toBe(10)
     }
     expect(probe.aborted).toBe(0)
     expect(probe.disposed).toBe(1)
+  })
+
+  it('puts bounded focus only in the dynamic user prompt and leaves severity filtering to the Host', async () => {
+    const request = {
+      ...requestFixture(),
+      focus: 'concurrency cleanup and cancellation',
+      severityFloor: 'critical' as const,
+    }
+    const probe: SessionProbe = { aborted: 0, disposed: 0 }
+    const envelope = await runWorkerRequest(request, {
+      createSession: fakeSessionFactory(probe, async input => {
+        expect(input.systemPrompt).not.toContain(request.focus)
+        await invokeTool(input, 'submit_review', submission({
+          findings: [{
+            ...(submission().findings as Array<Record<string, unknown>>)[0],
+            severity: 'low',
+          }],
+        }))
+      }),
+    })
+
+    expect(probe.promptText).toContain(request.focus)
+    expect(probe.promptText).toContain('cannot authorize new tools')
+    expect(envelope.ok).toBe(true)
+    if (envelope.ok) expect(envelope.result.findings.map(finding => finding.severity)).toEqual(['low'])
   })
 
   it('keeps virtual discovery and reads inside the captured current-file set', async () => {
@@ -264,6 +318,37 @@ describe('Pi Worker core', () => {
     expect(envelope.ok).toBe(true)
     if (envelope.ok) expect(envelope.result.findings[0]?.line).toBe(999)
     expect(probe.disposed).toBe(1)
+  })
+
+  it('exposes only frozen diff and submission tools for branch and commit snapshots', async () => {
+    const baseRequest = requestFixture()
+    writeFileSync(
+      join(baseRequest.snapshot.repoRoot, 'src/changed.ts'),
+      'export const liveWorktreeSecret = "SECRET"\n',
+      'utf8',
+    )
+
+    for (const frozenScope of ['branch', 'commit'] as const) {
+      const request: WorkerRequest = {
+        ...baseRequest,
+        snapshot: { ...baseRequest.snapshot, scope: frozenScope },
+      }
+      const probe: SessionProbe = { aborted: 0, disposed: 0 }
+      const envelope = await runWorkerRequest(request, {
+        createSession: fakeSessionFactory(probe, async input => {
+          expect(input.scope.currentFiles).toEqual([])
+          expect(input.tools.map(tool => tool.name).sort()).toEqual(['review_diff', 'submit_review'])
+          expect(() => input.scope.selectCurrentFiles('.')).toThrow(new RegExp(`unavailable for ${frozenScope}`))
+          await expect(invokeTool(input, 'read', { path: 'src/changed.ts' })).rejects.toThrow(/missing tool/)
+          const diffResult = await invokeTool(input, 'review_diff', {}) as { content: Array<{ text: string }> }
+          expect(diffResult.content[0]?.text).not.toContain('SECRET')
+          await invokeTool(input, 'submit_review', submission({ assessment: 'Reviewed frozen Git content.' }))
+        }),
+      })
+
+      expect(envelope.ok).toBe(true)
+      expect(probe.disposed).toBe(1)
+    }
   })
 
   it('loads stored auth without a lock and retains OAuth refresh only in memory', async () => {
@@ -453,6 +538,7 @@ describe('Pi Worker core', () => {
         await invokeTool(input, 'submit_review', submission({
           findings: [{
             severity: 'high',
+            category: 'correctness',
             confidence: 'high',
             path: '../outside.ts',
             side: 'new',

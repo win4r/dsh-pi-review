@@ -5,6 +5,7 @@ import z from '@deepseek-ai/schemastery'
 export interface Config {
   authority?: 'direct-human' | 'root-turn'
   model?: string
+  modelProfiles?: Record<string, string>
   thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
   timeoutMs?: number
   maxDiffBytes?: number
@@ -21,6 +22,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   authority: z.union(['direct-human', 'root-turn']).default('direct-human'),
   model: z.string(),
+  modelProfiles: z.dict(z.string()).default({}),
   thinkingLevel: z.union(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']).default('high'),
   timeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(300_000),
   maxDiffBytes: z.number().step(1).min(1_024).max(16_777_216).default(524_288),
@@ -37,6 +39,7 @@ export const Config: z<Config> = z.object({
 export interface ResolvedConfig {
   readonly authority: 'direct-human' | 'root-turn'
   readonly model?: string
+  readonly modelProfiles: Readonly<Record<string, string>>
   readonly thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
   readonly timeoutMs: number
   readonly maxDiffBytes: number
@@ -61,6 +64,17 @@ function optionalText(value: string | undefined, field: string): string | undefi
   if (value === undefined) return undefined
   const normalized = value.trim()
   if (normalized.length === 0) throw new TypeError(`${field} must be non-empty when provided`)
+  return normalized
+}
+
+export function validateModelIdentifier(value: string, field = 'model'): string {
+  const normalized = value.trim()
+  const separator = normalized.indexOf('/')
+  if (normalized.length === 0 || normalized.length > 512
+    || separator < 1 || separator === normalized.length - 1
+    || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new TypeError(`${field} must use a bounded provider/model-id value`)
+  }
   return normalized
 }
 
@@ -102,10 +116,20 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   const agentDir = agentDirValue === undefined
     ? undefined
     : resolve(isAbsolute(agentDirValue) ? agentDirValue : resolve(process.cwd(), agentDirValue))
-  const model = optionalText(config.model, 'model')
+  const modelText = optionalText(config.model, 'model')
+  const model = modelText === undefined ? undefined : validateModelIdentifier(modelText, 'model')
+  const modelProfiles: Record<string, string> = {}
+  for (const [profile, value] of Object.entries(config.modelProfiles ?? {})) {
+    if (!/^[a-z][a-z0-9_-]{0,63}$/.test(profile)) {
+      throw new TypeError(`modelProfiles contains an invalid profile name: ${profile}`)
+    }
+    if (typeof value !== 'string') throw new TypeError(`modelProfiles.${profile} must be a string`)
+    modelProfiles[profile] = validateModelIdentifier(value, `modelProfiles.${profile}`)
+  }
   return {
     authority,
     ...(model === undefined ? {} : { model }),
+    modelProfiles,
     thinkingLevel,
     timeoutMs: positiveInteger(config.timeoutMs, 300_000, 'timeoutMs', 3_600_000),
     maxDiffBytes: positiveInteger(config.maxDiffBytes, 524_288, 'maxDiffBytes', 16_777_216),

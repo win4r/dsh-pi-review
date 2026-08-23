@@ -62,6 +62,7 @@ function fixture(): { root: string, outside: string, snapshot: GitSnapshot } {
 function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
   return {
     severity: 'high',
+    category: 'correctness',
     confidence: 'high',
     path: 'src/current.ts',
     side: 'new',
@@ -178,6 +179,20 @@ describe('ReviewScope filesystem boundary', () => {
     expect(stagedFinding.path).toBe('src/current.ts')
     expect(() => scope.validateCurrentLine(stagedFinding)).not.toThrow()
   })
+
+  it('never maps frozen branch or commit snapshots to live worktree files', async () => {
+    const { root, snapshot } = fixture()
+    writeFileSync(join(root, 'src/current.ts'), 'export const liveWorktreeSecret = true\n', 'utf8')
+
+    for (const frozenScope of ['branch', 'commit'] as const) {
+      const scope = new ReviewScope({ ...snapshot, scope: frozenScope })
+      expect(scope.currentFiles).toEqual([])
+      expect(scope.virtualExists(root)).toBe(false)
+      expect(() => scope.assertCurrentFile('src/current.ts')).toThrow(new RegExp(`unavailable for ${frozenScope}`))
+      expect(() => scope.selectCurrentFiles('.')).toThrow(new RegExp(`unavailable for ${frozenScope}`))
+      expect(() => scope.validateCurrentLine(finding({ line: 999 }))).not.toThrow()
+    }
+  })
 })
 
 describe('ReviewScope finding boundary', () => {
@@ -199,6 +214,7 @@ describe('ReviewScope finding boundary', () => {
     expect(() => scope.normalizeFinding(finding({ path: 'src/new.ts', side: 'old' }))).toThrow(ScopeError)
     expect(() => scope.normalizeFinding(finding({ path: 'src/unchanged-secret.ts' }))).toThrow(ScopeError)
     expect(() => scope.normalizeFinding(finding({ path: '../outside.ts' }))).toThrow(ScopeError)
+    expect(() => scope.normalizeFinding(finding({ category: 'invalid' as never }))).toThrow(/category/)
     expect(() => scope.validateCurrentLine(finding({ line: 99 }))).toThrow(/exceeds/)
   })
 

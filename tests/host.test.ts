@@ -6,6 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentStatus } from '@deepseek-ai/dsh-agent'
 import { CallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import SandboxProvider from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -17,6 +18,7 @@ import { resolveConfig } from '../src/config.ts'
 import {
   applyReviewHost,
   createReviewTool,
+  normalizeReviewCall,
   ReviewHost,
   sameSnapshot,
   workerEntrypoint,
@@ -83,11 +85,11 @@ function stubAgent(id: string, cwd: string, agentContext: Context = new Context(
   return { agent, session, setStatus(value) { status = value } }
 }
 
-function openHumanTurn(stub: StubAgent): void {
+function openTurn(stub: StubAgent, source: MessageSource = { kind: 'user' }): void {
   stub.session.append('turn/start', { turn: 1 })
   stub.session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: 'review' }],
-    source: { kind: 'user' },
+    source,
   }), { surfaceOp: 'append' })
 }
 
@@ -123,7 +125,12 @@ async function repository(): Promise<string> {
   return root
 }
 
-async function workerScript(root: string, mutate = false, exitCode = 0): Promise<string> {
+async function workerScript(
+  root: string,
+  mutate = false,
+  exitCode = 0,
+  severities: readonly ('high' | 'low')[] = ['high'],
+): Promise<string> {
   const path = join(root, mutate ? 'mutating-worker.mjs' : exitCode === 0 ? 'worker.mjs' : 'nonzero-worker.mjs')
   const source = `
 let input = ''
@@ -133,17 +140,24 @@ if (process.env.DSH_PI_REVIEW_AMBIENT !== undefined) throw new Error('ambient en
 const request = JSON.parse(input)
 ${mutate ? "await import('node:fs/promises').then(fs => fs.appendFile(new URL('./reviewed.ts', 'file://' + request.snapshot.repoRoot + '/'), '// changed during review\\n'))" : ''}
 const findingPath = request.snapshot.changedPaths[0].path
+const findings = ${JSON.stringify(severities)}.map(severity => ({
+  severity, category: 'correctness', confidence: 'high', path: findingPath, side: 'new', line: 1,
+  title: 'Incorrect value', evidence: 'The changed line uses the wrong value.',
+  impact: 'Callers observe an invalid result.', suggestion: 'Restore the intended value.'
+}))
 process.stdout.write(JSON.stringify({
-  protocolVersion: 1,
+  protocolVersion: 2,
   ok: true,
   result: {
     assessment: 'A concrete regression was found.',
-    findings: [{
-      severity: 'high', confidence: 'high', path: findingPath, side: 'new', line: 1,
-      title: 'Incorrect value', evidence: 'The changed line uses the wrong value.',
-      impact: 'Callers observe an invalid result.', suggestion: 'Restore the intended value.'
-    }],
-    model: 'test/reviewer', durationMs: 7
+    findings,
+    provider: 'test', model: 'test/reviewer',
+    usage: {
+      reported: true, turns: 1, inputTokens: 10, outputTokens: 4,
+      cacheReadTokens: 2, cacheWriteTokens: 1, totalTokens: 17,
+      estimatedCostUsd: 0.01
+    },
+    durationMs: 7
   }
 }) + '\\n')
 process.exitCode = ${String(exitCode)}
@@ -155,6 +169,7 @@ process.exitCode = ${String(exitCode)}
 async function harness(
   root: string,
   sandbox: typeof FullSandbox | typeof PartialSandbox,
+  source: MessageSource = { kind: 'user' },
 ): Promise<{ ctx: Context; rootAgent: StubAgent }> {
   const ctx = new Context()
   await ctx.plugin(AgentRegistry)
@@ -162,7 +177,7 @@ async function harness(
   await ctx.plugin(sandbox)
   const rootAgent = stubAgent(`host-root-${Math.random()}`, root)
   ctx.agents.register(rootAgent.agent)
-  openHumanTurn(rootAgent)
+  openTurn(rootAgent, source)
   return { ctx, rootAgent }
 }
 
@@ -192,7 +207,45 @@ describe('Harness host review transaction', () => {
       findings: [{ severity: 'high', path: 'reviewed.ts' }],
       snapshot: { stale: false },
       sandbox: { mode: 'read-only', enforcement: 'full' },
+      policy: { severityFloor: 'low', suppressedBelowFloor: 0 },
+      provider: 'test',
       model: 'test/reviewer',
+      usage: { reported: true, totalTokens: 17, estimatedCostUsd: 0.01 },
+    })
+  })
+
+  it('filters below-floor findings at the host and distinguishes below-threshold-only', async () => {
+    const root = await repository()
+    const mixedWorker = await workerScript(root, false, 0, ['high', 'low'])
+    const { ctx, rootAgent } = await harness(root, FullSandbox)
+    const mixedHost = new ReviewHost(ctx, resolveConfig({
+      maxDiffBytes: 65_536,
+      maxFiles: 10,
+      maxOutputBytes: 65_536,
+      timeoutMs: 20_000,
+    }), mixedWorker)
+    const mixed = await ctx.agents.withInitiator(rootAgent.agent, () => mixedHost.review({
+      scope: 'working-tree', severity_floor: 'high', focus: ' concurrency and errors ',
+    }, execution(rootAgent.agent)))
+    expect(mixed).toMatchObject({
+      verdict: 'findings',
+      findings: [{ severity: 'high' }],
+      policy: {
+        severityFloor: 'high',
+        focus: 'concurrency and errors',
+        suppressedBelowFloor: 1,
+      },
+    })
+
+    const lowWorker = await workerScript(root, false, 0, ['low'])
+    const lowHost = new ReviewHost(ctx, mixedHost.config, lowWorker)
+    const low = await ctx.agents.withInitiator(rootAgent.agent, () => lowHost.review({
+      scope: 'working-tree', severity_floor: 'high',
+    }, execution(rootAgent.agent)))
+    expect(low).toMatchObject({
+      verdict: 'below-threshold-only',
+      findings: [],
+      policy: { suppressedBelowFloor: 1 },
     })
   })
 
@@ -225,6 +278,20 @@ describe('Harness host review transaction', () => {
       .rejects.toMatchObject({ code: 'PI_REVIEW_SANDBOX_INSUFFICIENT' })
   })
 
+  it('requires a direct-human turn for per-call model profile selection', async () => {
+    const root = await repository()
+    const { ctx, rootAgent } = await harness(root, FullSandbox, { kind: 'plugin', plugin: 'scheduler' })
+    const host = new ReviewHost(ctx, resolveConfig({
+      authority: 'root-turn',
+      model: 'default/reviewer',
+      modelProfiles: { deep: 'approved/deep-review' },
+      timeoutMs: 20_000,
+    }), join(root, 'must-not-run.mjs'))
+    await expect(ctx.agents.withInitiator(rootAgent.agent, () => host.review({
+      scope: 'working-tree', model_profile: 'deep',
+    }, execution(rootAgent.agent)))).rejects.toMatchObject({ code: 'PI_REVIEW_AUTHORITY_REQUIRED' })
+  })
+
   it('rejects a success envelope followed by a non-zero Worker exit', async () => {
     const root = await repository()
     const worker = await workerScript(root, false, 1)
@@ -248,9 +315,39 @@ describe('root-scoped registration and presentation', () => {
     const tool = createReviewTool(host)
     expect(tool.parameters).toMatchObject({
       type: 'object', additionalProperties: false,
-      properties: { scope: { enum: ['unstaged', 'staged', 'working-tree', 'base'] } },
+      properties: { scope: { enum: ['unstaged', 'staged', 'working-tree', 'base', 'branch', 'commit'] } },
     })
     expect(workerEntrypoint('file:///tmp/package/dist/index.mjs')).toBe('/tmp/package/dist/worker.mjs')
+  })
+
+  it('normalizes bounded policy controls and resolves only deployment model profiles', () => {
+    const config = resolveConfig({
+      model: 'default/reviewer',
+      modelProfiles: { deep: 'approved/deep-review' },
+    })
+    expect(normalizeReviewCall({
+      scope: 'branch',
+      base_ref: 'main',
+      head_ref: 'feature',
+      focus: ' concurrency ',
+      severity_floor: 'high',
+      model_profile: 'deep',
+    }, config)).toEqual({
+      snapshot: { scope: 'branch', baseRef: 'main', headRef: 'feature' },
+      focus: 'concurrency',
+      severityFloor: 'high',
+      model: 'approved/deep-review',
+      modelProfileSelected: true,
+    })
+    expect(() => normalizeReviewCall({
+      scope: 'working-tree', model_profile: 'unknown',
+    }, config)).toThrow(/not enabled/)
+    expect(() => normalizeReviewCall({
+      scope: 'working-tree', focus: 'x'.repeat(2_049),
+    }, config)).toThrow(/bounded text/)
+    expect(() => normalizeReviewCall({
+      scope: 'working-tree', cwd: '/tmp',
+    }, config)).toThrow(/unsupported arguments/)
   })
 
   it('registers current and future roots once, skips children, and disposes registrations', async () => {

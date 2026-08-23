@@ -16,9 +16,11 @@ export function apply(ctx: Context, config: PluginConfig = {}): void {
 export type {
   ChangedPath,
   GitSnapshot,
+  ReviewCategory,
   ReviewConfidence,
   ReviewFinding,
   ReviewResult,
   ReviewScope,
   ReviewSeverity,
+  ReviewUsage,
 } from './types.ts'

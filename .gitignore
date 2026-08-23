@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+graphify-out/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store

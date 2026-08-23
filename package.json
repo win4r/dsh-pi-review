@@ -1,0 +1,86 @@
+{
+  "name": "@charlesqin/dsh-pi-review",
+  "version": "0.1.0",
+  "description": "Read-only Pi Agent review of Git changes for DeepSeek Harness",
+  "keywords": [
+    "deepseek-harness",
+    "pi-agent",
+    "code-review",
+    "git-diff",
+    "dsh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/win4r/dsh-pi-review.git"
+  },
+  "homepage": "https://github.com/win4r/dsh-pi-review#readme",
+  "bugs": {
+    "url": "https://github.com/win4r/dsh-pi-review/issues"
+  },
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:real": "pnpm run build && node scripts/real-smoke.mjs",
+    "test:watch": "vitest",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "prepare": "pnpm run build",
+    "prepack": "pnpm run check"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "typebox": "1.3.7"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-subprocess": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-sandbox-local": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-subprocess": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.2",
+    "@types/node": "22.19.7",
+    "tsdown": "0.22.14",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "license": "MIT",
+  "packageManager": "pnpm@10.4.1"
+}

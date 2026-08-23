@@ -1,0 +1,13 @@
+- insert:
+    - id: pi-review
+      name: '@charlesqin/dsh-pi-review'
+      config:
+        authority: direct-human
+        thinkingLevel: high
+        timeoutMs: 300000
+        maxDiffBytes: 524288
+        maxFiles: 200
+        maxOutputBytes: 524288
+        maxDiagnosticBytes: 65536
+        disposeGraceMs: 3000
+        requireFullSandbox: true

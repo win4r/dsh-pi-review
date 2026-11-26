@@ -1,5 +1,3 @@
-# [🚀观看我的哔哩哔哩视频](https://space.bilibili.com/3493277319825652)
-
 # dsh-pi-review
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供隔离、只读的 [Pi Agent](https://github.com/earendil-works/pi) Git 改动审查。它注册一个根 Agent 工具 `pi_review_diff`，冻结确定性的 Git 快照，在 Harness 的只读沙箱中启动独立 Pi SDK Worker，并返回带分类、严重度策略和 Pi 用量统计的可验证结构化 finding。
